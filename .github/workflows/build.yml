@@ -1,0 +1,168 @@
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      mcpelauncher_ref:
+        description: "crossover-gdk ref to build"
+        required: false
+        default: "macOS"
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  INTEL_BREW: /usr/local/bin/brew
+  INTEL_PREFIX: /usr/local
+  WORKROOT: ${{ github.workspace }}/work
+  STAGE: ${{ github.workspace }}/stage
+  DIST: ${{ github.workspace }}/dist
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out workflow repo
+        uses: actions/checkout@v6
+
+      - name: Show runner info
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: Install Rosetta
+        shell: bash
+        run: |
+          set -euxo pipefail
+          softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Install Intel Homebrew
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [ ! -x /usr/local/bin/brew ]; then
+            arch -x86_64 /bin/bash -c \
+              "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+
+          arch -x86_64 /usr/local/bin/brew --version
+          arch -x86_64 /usr/local/bin/brew config
+
+      - name: Install Intel brew dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          arch -x86_64 "${INTEL_BREW}" install gnutls freetype vulkan-headers vulkan-loader molten-vk
+          brew install llvm@21 bison lld@21
+          $(brew --prefix llvm@21)/bin/llvm-dlltool --help || :
+          echo Update Env
+          echo "LLVM_BINDIR=$(brew --prefix llvm@21)/bin" >> "$GITHUB_ENV"
+          echo Update Env
+          echo "MOLTENVK_DIR=$(arch -x86_64 "${INTEL_BREW}" --prefix molten-vk)" >> "$GITHUB_ENV"
+          echo Update Env
+          echo "VULKAN_HEADER_DIR=$(arch -x86_64 "${INTEL_BREW}" --prefix vulkan-headers)" >> "$GITHUB_ENV"
+          echo Update Env
+          echo "VULKAN_LOADER_DIR=$(arch -x86_64 "${INTEL_BREW}" --prefix vulkan-loader)" >> "$GITHUB_ENV"
+          echo Update Env
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+          echo Update Env
+          echo "$(brew --prefix lld@21)/bin" >> "$GITHUB_PATH"
+          echo Update Env
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo Update Env
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$WORKROOT" "$STAGE" "$DIST"
+          mkdir -p "$WORKROOT"/downloads "$WORKROOT"/toolchains "$WORKROOT"/src "$WORKROOT"/runtime
+
+      - name: Fetch mcpelauncher-gdk macOS branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "${{ inputs.mcpelauncher_ref }}" \
+            https://github.com/minecraft-linux/crossover-gdk.git \
+            "$WORKROOT/src/mcpelauncher-gdk"
+
+      - name: Build (autotools style)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$WORKROOT/src/mcpelauncher-gdk"
+
+          export SDKROOT="$(xcrun --show-sdk-path)"
+
+          echo "PATH=$PATH"
+
+          arch -x86_64 ./configure --prefix="$STAGE" CC=clang CXX=clang++ "CFLAGS=-O3 -I/usr/local/include -I$VULKAN_HEADER_DIR/include --target=x86_64-apple-darwin" "LDFLAGS=-L$VULKAN_LOADER_DIR/lib -L/usr/local/lib" "x86_64_CC=${LLVM_BINDIR}/clang" "x86_64_CXX=${LLVM_BINDIR}/clang++" "x86_64_CFLAGS=-O3" x86_64_LDFLAGS=-fuse-ld=lld --enable-archs=x86_64 --build=x86_64-apple-darwin --host=x86_64-apple-darwin FREETYPE_CFLAGS=-I/usr/local/include/freetype2 FREETYPE_LIBS=/usr/local/lib/libfreetype.6.dylib build_alias=x86_64-apple-darwin host_alias=x86_64-apple-darwin
+          cat include/config.h || :
+          arch -x86_64 make -j$(sysctl -n hw.ncpu)
+          arch -x86_64 make install
+
+      - name: Bundle runtime dependencies
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "$STAGE/lib" "$STAGE/share/minecraft-gdk-runtime"
+
+          zsh "$WORKROOT/src/mcpelauncher-gdk/bundle-macho-deps.zsh" \
+            "$STAGE" \
+            "$STAGE/lib" \
+            "${INTEL_PREFIX}/opt/gnutls/lib/libgnutls."*.dylib \
+            "${INTEL_PREFIX}/opt/freetype/lib/libfreetype."*.dylib \
+            "${INTEL_PREFIX}/opt/vulkan-loader/lib/libvulkan."*.dylib \
+            "${INTEL_PREFIX}/opt/molten-vk/lib/libMoltenVK.dylib"
+
+      - name: Create self-contained bottle archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          NAME="mcpelauncher-gdk-macos-intel"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
+          tar -C "$STAGE" -czf "$DIST/${NAME}.tar.gz" .
+
+          shasum -a 256 "$DIST/${NAME}.tar.gz" | tee "$DIST/${NAME}.sha256"
+
+      - name: Upload bottle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcpelauncher-gdk-macos-intel-bottle
+          path: dist/${{ env.ARTIFACT_NAME }}.tar.gz
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload bottle checksum artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcpelauncher-gdk-macos-intel-bottle-sha256
+          path: dist/${{ env.ARTIFACT_NAME }}.sha256
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload Log
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcpelauncher-gdk-macos-intel-log
+          path: work/src/mcpelauncher-gdk/config.log
+          archive: false
+          if-no-files-found: ignore
+
+      - name: Upload Config
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcpelauncher-gdk-macos-intel-config
+          path: work/src/mcpelauncher-gdk/include/config.h
+          archive: false
+          if-no-files-found: ignore
