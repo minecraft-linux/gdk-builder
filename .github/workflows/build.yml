@@ -114,7 +114,7 @@ jobs:
 
           mkdir -p "$STAGE/lib" "$STAGE/share/minecraft-gdk-runtime"
 
-          zsh "$WORKROOT/src/mcpelauncher-gdk/bundle-macho-deps.zsh" \
+          zsh "./bundle-macho-deps.zsh" \
             "$STAGE" \
             "$STAGE/lib" \
             "${INTEL_PREFIX}/opt/gnutls/lib/libgnutls."*.dylib \
